@@ -1,16 +1,15 @@
 use anyhow::{anyhow, Result};
 use cln_plugin::options::{ConfigOption, Value};
 use cln_rpc::model::{WaitanyinvoiceRequest, WaitanyinvoiceResponse};
-use nostr_sdk::{EventBuilder, Keys, Tag};
+use futures::{Stream, StreamExt};
+use log::{debug, warn};
 use std::path::PathBuf;
+use std::time::Duration;
 use tokio::io::{stdin, stdout};
 
 use nostr_sdk::event::Event;
 use nostr_sdk::prelude::*;
-
-use std::string::String;
-
-use log::warn;
+use nostr_sdk::{EventBuilder, Keys, Tag};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -54,23 +53,8 @@ async fn main() -> anyhow::Result<()> {
 
     let keys = Keys::from_sk_str(&nostr_sec_key)?;
 
-    loop {
-        let invoice = match wait_for_invoice(&rpc_socket).await {
-            Ok(invoice) => invoice,
-            Err(err) => {
-                warn!("Error while waiting for invoice: {}", err);
-                continue;
-            }
-        };
-
-        let zap_request_info = match decode_zapreq(&invoice.description) {
-            Ok(info) => info,
-            Err(err) => {
-                warn!("Error while decoding zap request info: {}", err);
-                continue;
-            }
-        };
-
+    let mut invoices = invoice_stream(&rpc_socket).await?;
+    while let Some((zap_request_info, invoice)) = invoices.next().await {
         let zap_note = match create_zap_note(&keys, zap_request_info.clone(), invoice) {
             Ok(note) => note,
             Err(err) => {
@@ -92,6 +76,8 @@ async fn main() -> anyhow::Result<()> {
             continue;
         };
     }
+
+    Ok(())
 }
 
 async fn broadcast_zap_note(keys: &Keys, relays: Vec<String>, zap_note: Event) -> Result<()> {
@@ -108,18 +94,56 @@ async fn broadcast_zap_note(keys: &Keys, relays: Vec<String>, zap_note: Event) -
     Ok(())
 }
 
-async fn wait_for_invoice(socket_addr: &PathBuf) -> Result<WaitanyinvoiceResponse> {
-    let mut cln_client = cln_rpc::ClnRpc::new(&socket_addr).await?;
+async fn invoice_stream(
+    socket_addr: &PathBuf,
+) -> Result<impl Stream<Item = (ZapRequestInfo, WaitanyinvoiceResponse)>> {
+    let cln_client = cln_rpc::ClnRpc::new(&socket_addr).await?;
 
-    let invoice = cln_client
-        .call(cln_rpc::Request::WaitAnyInvoice(WaitanyinvoiceRequest {
-            timeout: None,
-            lastpay_index: None,
-        }))
-        .await?;
+    Ok(futures::stream::unfold(
+        (cln_client, None),
+        |(mut cln_client, mut last_pay_idx)| async move {
+            // We loop here since some invoices aren't zaps, in which case we wait for the next one and don't yield
+            loop {
+                let invoice_res = cln_client
+                    .call(cln_rpc::Request::WaitAnyInvoice(WaitanyinvoiceRequest {
+                        timeout: None,
+                        lastpay_index: last_pay_idx,
+                    }))
+                    .await;
 
-    let invoice: WaitanyinvoiceResponse = invoice.try_into().unwrap();
-    Ok(invoice)
+                let invoice: WaitanyinvoiceResponse = match invoice_res {
+                    Ok(invoice) => invoice,
+                    Err(e) => {
+                        warn!("Error fetching invoice: {e}");
+                        // Let's not spam CLN with requests on failure
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        // Retry same reqeuest
+                        continue;
+                    }
+                }
+                .try_into()
+                .expect("Wrong response from CLN");
+
+                match decode_zapreq(&invoice.description) {
+                    Ok(zap) => {
+                        let pay_idx = invoice.pay_index;
+                        // yield zap
+                        break Some(((zap, invoice), (cln_client, pay_idx)));
+                    }
+                    Err(e) => {
+                        debug!(
+                            "Error while decoding zap (likely just not a zap invoice): {}",
+                            e
+                        );
+                        // Process next invoice without yielding anything
+                        last_pay_idx = invoice.pay_index;
+                        continue;
+                    }
+                }
+            }
+        },
+    )
+    .boxed())
 }
 
 #[derive(Clone)]
