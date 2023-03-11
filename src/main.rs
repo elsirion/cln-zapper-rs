@@ -66,7 +66,7 @@ async fn main() -> anyhow::Result<()> {
         let zap_request_info = match decode_zapreq(&invoice.description) {
             Ok(info) => info,
             Err(err) => {
-                warn!("Error while decoding zap request info: {}", err);
+                warn!("Error while decoding zap request info: {}, zap: {}", err, invoice.description);
                 continue;
             }
         };
