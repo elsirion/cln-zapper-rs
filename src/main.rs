@@ -2,7 +2,7 @@ use anyhow::{anyhow, Result};
 use cln_plugin::options::{ConfigOption, Value};
 use cln_rpc::model::{WaitanyinvoiceRequest, WaitanyinvoiceResponse};
 use futures::{Stream, StreamExt};
-use log::{debug, warn};
+use log::{info, warn};
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::io::{stdin, stdout};
@@ -55,6 +55,7 @@ async fn main() -> anyhow::Result<()> {
 
     let mut invoices = invoice_stream(&rpc_socket).await?;
     while let Some((zap_request_info, invoice)) = invoices.next().await {
+        info!("Processing zap: {:?}", zap_request_info);
         let zap_note = match create_zap_note(&keys, zap_request_info.clone(), invoice) {
             Ok(note) => note,
             Err(err) => {
@@ -131,9 +132,10 @@ async fn invoice_stream(
                         break Some(((zap, invoice), (cln_client, pay_idx)));
                     }
                     Err(e) => {
-                        debug!(
-                            "Error while decoding zap (likely just not a zap invoice): {}",
-                            e
+                        warn!(
+                            "Error while decoding zap (likely just not a zap invoice): {}, zap: {}",
+                            e,
+                            invoice.description
                         );
                         // Process next invoice without yielding anything
                         last_pay_idx = invoice.pay_index;
@@ -146,7 +148,7 @@ async fn invoice_stream(
     .boxed())
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct ZapRequestInfo {
     p: Tag,
     e: Option<Tag>,
